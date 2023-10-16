@@ -20,6 +20,15 @@
 #include <unistd.h>
 #include <signal.h>
 #include <getopt.h>
+#include <string>
+#include <cstring>
+// #include <cstdio>
+// #include <cstdlib>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <socket_lib.h>
 
 /* Attempt to determine the execution prefix automatically.  autoconf
  * sets PREFIX, and pconfigure sets __PCONFIGURE__PREFIX. */
@@ -92,7 +101,6 @@ void htif_t::start()
       exit(1);
     }
   }
-
   reset();
 }
 
@@ -103,8 +111,7 @@ static void bad_address(const std::string& situation, reg_t addr)
   exit(-1);
 }
 
-std::map<std::string, uint64_t> htif_t::load_payload(const std::string& payload, reg_t* entry)
-{
+static std::string find_file(const std::string& payload) {
   std::string path;
   if (access(payload.c_str(), F_OK) == 0)
     path = payload;
@@ -116,7 +123,7 @@ std::map<std::string, uint64_t> htif_t::load_payload(const std::string& payload,
     else
       throw std::runtime_error(
         "could not open " + payload + "; searched paths:\n" +
-        "\t. (current directory)\n" + 
+        "\t. (current directory)\n" +
         "\t" + PREFIX TARGET_DIR + " (based on configured --prefix and --with-target)"
       );
   }
@@ -125,6 +132,13 @@ std::map<std::string, uint64_t> htif_t::load_payload(const std::string& payload,
     throw std::runtime_error(
         "could not open " + payload +
         " (did you misspell it? If VCS, did you forget +permissive/+permissive-off?)");
+
+  return path;
+}
+
+std::map<std::string, uint64_t> htif_t::load_payload(const std::string& payload, reg_t* entry)
+{
+  std::string path = find_file(payload);
 
   // temporarily construct a memory interface that skips writing bytes
   // that have already been preloaded through a sideband
@@ -243,55 +257,249 @@ void htif_t::clear_chunk(addr_t taddr, size_t len)
     write_chunk(taddr + pos, std::min(len - pos, chunk_max_size()), zeros);
 }
 
+#define CHECK_TOKEN_SIZE(x) \
+  if (tokens.size() != (x)) { \
+    std::cout << "Expecting " << x << " operands, found " << tokens.size() << std::endl; \
+    continue; \
+  }
+
+struct read_req {
+    uint32_t addr;
+    uint32_t size;
+};
+
+struct write_req {
+    uint32_t addr;
+    uint32_t size;
+};
+
 int htif_t::run()
 {
-  start();
+
+  bool binary_none = (!targs.empty() && targs[0] == "none");
+  bool binary_socket = (!targs.empty() && targs[0] == "socket");
 
   auto enq_func = [](std::queue<reg_t>* q, uint64_t x) { q->push(x); };
   std::queue<reg_t> fromhost_queue;
   std::function<void(reg_t)> fromhost_callback =
     std::bind(enq_func, &fromhost_queue, std::placeholders::_1);
 
-  if (tohost_addr == 0) {
+  if (!binary_none && !binary_socket) {
+    start();
+  }
+
+  if (!binary_socket && (tohost_addr == 0)) {
     while (true)
       idle();
   }
 
+  if (binary_socket) {
+    init_client(6969);
+  }
+
+  uint64_t counter = 0;
+  uint64_t tohost = 0;
+  bool tohost_found = false;
+  bool fromhost_found = false;
+
+  int num_waits = 0;
   while (!signal_exit && exitcode == 0)
   {
-    uint64_t tohost;
 
-    try {
-      if ((tohost = from_target(mem.read_uint64(tohost_addr))) != 0)
-        mem.write_uint64(tohost_addr, target_endian<uint64_t>::zero);
-    } catch (mem_trap_t& t) {
-      bad_address("accessing tohost", t.get_tval());
-    }
-
-    try {
-      if (tohost != 0) {
-        command_t cmd(mem, tohost, fromhost_callback);
-        device_list.handle_command(cmd);
-      } else {
-        idle();
+    if (tohost_addr != 0) {
+      try {
+        if ((tohost = from_target(mem.read_uint64(tohost_addr))) != 0)
+          mem.write_uint64(tohost_addr, target_endian<uint64_t>::zero);
+      } catch (mem_trap_t& t) {
+        bad_address("accessing tohost", t.get_tval());
       }
-
+      try {
+        if (tohost != 0) {
+          command_t cmd(mem, tohost, fromhost_callback);
+          device_list.handle_command(cmd);
+        } else {
+          idle();
+        }
+        device_list.tick();
+      } catch (mem_trap_t& t) {
+        std::stringstream tohost_hex;
+        tohost_hex << std::hex << tohost;
+        bad_address("host was accessing memory on behalf of target (tohost = 0x" + tohost_hex.str() + ")", t.get_tval());
+      }
+    } else {
+      idle();
       device_list.tick();
-    } catch (mem_trap_t& t) {
-      std::stringstream tohost_hex;
-      tohost_hex << std::hex << tohost;
-      bad_address("host was accessing memory on behalf of target (tohost = 0x" + tohost_hex.str() + ")", t.get_tval());
     }
 
-    try {
-      if (!fromhost_queue.empty() && !mem.read_uint64(fromhost_addr)) {
-        mem.write_uint64(fromhost_addr, to_target(fromhost_queue.front()));
-        fromhost_queue.pop();
+    if (fromhost_addr != 0) {
+      try {
+        if (!fromhost_queue.empty() && !mem.read_uint64(fromhost_addr)) {
+          mem.write_uint64(fromhost_addr, to_target(fromhost_queue.front()));
+          fromhost_queue.pop();
+        }
+      } catch (mem_trap_t& t) {
+        bad_address("accessing fromhost", t.get_tval());
       }
-    } catch (mem_trap_t& t) {
-      bad_address("accessing fromhost", t.get_tval());
     }
+
+    if (!binary_socket) continue;
+    if (counter++ <= 100) continue;
+    counter = 0;
+
+    if (num_waits > 0) {
+      uint32_t cease;
+      read_chunk(0x7c000000UL, sizeof(cease), &cease);
+      if (cease > 0) {
+        for (; num_waits > 0; num_waits--) socket_send(0, 4, empty_vec, empty_vec);
+      }
+    }
+
+    for (func_id_t fi = 1; fi < 5; fi++) {
+      std::vector<char> buf;
+      if (socket_receive(fi, false, buf)) {
+        switch (fi) {
+          case 1: { // write request
+            struct write_req wreq;
+            deserialize_args(buf, wreq);
+            for (size_t i = 0; i < wreq.size; i += chunk_max_size()) {
+              size_t chunk_size = std::min(chunk_max_size(), wreq.size - i);
+              const char* data_ptr = buf.data() + sizeof(struct write_req) + i;
+              write_chunk(wreq.addr + i, chunk_size, data_ptr);
+              std::cout << "DEBUG: fesvr wrote 0x" << std::hex << chunk_size << " bytes to 0x" << (wreq.addr + i) << std::endl;
+            }
+            socket_send(0, 1, empty_vec, empty_vec); // send acknowledgement
+            break;
+          }
+          case 2: { // read request
+            struct read_req rreq;
+            deserialize_args(buf, rreq);
+            std::vector<char> read_buffer;
+            read_buffer.resize(rreq.size);
+            std::cout << "DEBUG: fesvr reading 0x" << std::hex << rreq.size << " bytes from 0x" << rreq.addr << std::endl;
+            read_chunk(rreq.addr, rreq.size, read_buffer.data());
+            socket_send(0, 2, empty_vec, read_buffer); // send read result
+            break;
+          }
+          case 3: { // run
+            std::cout << "DEBUG: fesvr reset core" << std::endl;
+            reset();
+            socket_send(0, 3, empty_vec, empty_vec); // send acknowledgement
+            break;
+          }
+          case 4: { // wait
+            std::cout << "DEBUG: fesvr waiting for core to cease" << std::endl;
+            num_waits += 1;
+            break;
+          }
+          default:
+            std::cerr << "DEBUG: unknown function id " << fi << std::endl;
+        }
+      }
+    }
+
+    // // Receive data from the socket
+    // std::string line;
+    // std::string buffer;
+    // char chunk[1024];
+    // int bytes_read;
+
+    // if ((bytes_read = recv(new_socket, chunk, sizeof(chunk), 0)) > 0) {
+    //   buffer.append(chunk, bytes_read);
+    //   size_t pos;
+    //   if ((pos = buffer.find('\n')) != std::string::npos) {
+    //     line = buffer.substr(0, pos);
+    //     buffer.erase(0, pos + 1);
+
+    //     // Handle the received line (process it)
+    //     if (!line.empty()) {
+    //       std::cout << "Received line: " << line << std::endl;
+    //     }
+    //   } else {
+    //     std::cout << "Newline not found" << std::endl;
+    //     continue;
+    //   }
+    // } else {
+    //   continue;
+    // }
+
+    // std::istringstream iss(line);
+    // std::vector<std::string> tokens;
+    // std::string token;
+
+    // // Tokenize the input by space
+    // while (iss >> token) {
+    //   tokens.push_back(token);
+    // }
+    // if (tokens.size() < 1) continue;
+
+    // std::string command = tokens[0];
+
+    // // Handle commands
+    // if (command == "elf") {
+    //   CHECK_TOKEN_SIZE(2);
+    //   std::string path = tokens[1];
+    //   std::cout << "Loading elf from " << path << std::endl;
+    //   load_payload(path, &entry);
+    //   // load_program();
+    // } else if (command == "binary") {
+    //   CHECK_TOKEN_SIZE(3);
+    //   std::string path = tokens[2];
+    //   long address = std::strtol(tokens[1].c_str(), nullptr, 16);
+    //   std::cout << "Loading binary from " << path << " to memory address: " << std::hex << address << std::endl;
+    //   try {
+    //     path = find_file(path);
+    //     std::ifstream file(path, std::ios::binary);
+    //     if (!file) throw std::runtime_error("");
+    //     char buffer[chunk_max_size()];
+    //     size_t offset = 0;
+    //     while (file.good()) {
+    //       file.read(buffer, chunk_max_size());
+    //       size_t size = file.gcount();
+    //       if (size > 0) {
+    //         write_chunk(address + offset, size, buffer);
+    //         offset += size;
+    //       }
+    //     }
+    //     file.close();
+    //   } catch (...) {
+    //     std::cerr << "Binary loading failed" << std::endl;
+    //   }
+    // } else if (command == "sw") {
+    //   CHECK_TOKEN_SIZE(3);
+    //   long address = std::strtol(tokens[1].c_str(), nullptr, 16);
+    //   reg_t data = (reg_t) std::strtol(tokens[2].c_str(), nullptr, 0);
+    //   std::cout << "M[0x" << std::hex << address << "] <- 0x" << std::hex << data << std::endl;
+    //   write_chunk(address, sizeof(reg_t), &data);
+    // } else if (command == "read") {
+    //   CHECK_TOKEN_SIZE(3);
+    //   long address = std::strtol(tokens[1].c_str(), nullptr, 16);
+    //   size_t size = (size_t) std::strtol(tokens[2].c_str(), nullptr, 0);
+    //   char buffer[size];
+    //   std::cout << "Reading " << size << " bytes from 0x" << std::hex << address << std::endl;
+    //   read_chunk(address, size, buffer);
+    //   for (size_t offset = 0; offset < size; offset += 16) {
+    //     std::cout << "0x" << std::setw(8) << std::setfill('0') << std::hex << offset << ": ";
+    //     for (int i = 0; i < 16; i += 4) {
+    //       if (offset + i < size) {
+    //         auto word = *reinterpret_cast<const int*>(buffer + offset + i);
+    //         std::cout << std::setw(8) << std::setfill('0') << std::hex << word << ' ';
+    //       }
+    //     }
+    //     std::cout << std::endl;
+    //   }
+    // } else if (command == "run") {
+    //   std::cout << "Resetting core" << std::endl;
+    //   reset();
+    // } else if (command == "quit") {
+    //   exit(0);
+    // } else {
+    //   std::cerr << "Unknown command: " << command << std::endl;
+    //   std::cout << "Available commands: elf binary sw read run quit" << std::endl;
+    // }
+    // std::cout << "Ready for the next command" << std::endl;
   }
+  // std::cout << "Socket closed" << std::endl;
+  // close(new_socket);
 
   stop();
 
