@@ -1,5 +1,6 @@
 spike_main_subproject_deps = \
 	fdt \
+	socketlib \
 	fesvr \
 	softfloat \
 	disasm \

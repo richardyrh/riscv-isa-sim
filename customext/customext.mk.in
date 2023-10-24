@@ -1,5 +1,6 @@
 customext_subproject_deps = \
 	spike_main \
+	socketlib \
 	riscv \
 	disasm \
 	softfloat \

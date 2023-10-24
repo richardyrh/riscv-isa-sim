@@ -1,0 +1,3 @@
+[submodule "socketlib"]
+	path = socketlib
+	url = https://github.com/richardyrh/socket-lib.git

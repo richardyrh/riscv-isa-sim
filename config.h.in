@@ -109,6 +109,9 @@
 #undef RISCV_ENABLE_DUAL_ENDIAN
 
 /* Define if subproject MCPPBS_SPROJ_NORM is enabled */
+#undef SOCKETLIB_ENABLED
+
+/* Define if subproject MCPPBS_SPROJ_NORM is enabled */
 #undef SOFTFLOAT_ENABLED
 
 /* Define if subproject MCPPBS_SPROJ_NORM is enabled */
