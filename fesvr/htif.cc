@@ -28,7 +28,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <socket_lib.h>
+#include <socketlib.h>
 
 /* Attempt to determine the execution prefix automatically.  autoconf
  * sets PREFIX, and pconfigure sets __PCONFIGURE__PREFIX. */

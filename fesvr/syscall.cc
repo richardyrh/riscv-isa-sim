@@ -7,6 +7,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <limits.h>
 #include <errno.h>
 #include <stdlib.h>
@@ -164,6 +166,8 @@ syscall_t::syscall_t(htif_t* htif)
   table[79] = &syscall_t::sys_fstatat;
   table[80] = &syscall_t::sys_fstat;
   table[93] = &syscall_t::sys_exit;
+  table[198] = &syscall_t::sys_socket;
+  table[203] = &syscall_t::sys_connect;
   table[291] = &syscall_t::sys_statx;
   table[1039] = &syscall_t::sys_lstat;
   table[2011] = &syscall_t::sys_getmainvars;
@@ -271,6 +275,22 @@ reg_t syscall_t::sys_close(reg_t fd, reg_t a1, reg_t a2, reg_t a3, reg_t a4, reg
     return sysret_errno(-1);
   fds.dealloc(fd);
   return 0;
+}
+
+reg_t syscall_t::sys_socket(reg_t domain, reg_t type, reg_t protocol, reg_t a3, reg_t a4, reg_t a5, reg_t a6)
+{
+  int fd = sysret_errno(socket(domain, type, protocol));
+  if (fd < 0)
+    return sysret_errno(-1);
+  return fds.alloc(fd);
+}
+
+reg_t syscall_t::sys_connect(reg_t fd, reg_t pbuf, reg_t len, reg_t a3, reg_t a4, reg_t a5, reg_t a6)
+{
+  std::vector<char> buf(len);
+  memif->read(pbuf, len, buf.data());
+  reg_t ret = sysret_errno(connect(fds.lookup(fd), (const sockaddr*) buf.data(), len));
+  return ret;
 }
 
 reg_t syscall_t::sys_lseek(reg_t fd, reg_t ptr, reg_t dir, reg_t a3, reg_t a4, reg_t a5, reg_t a6)
