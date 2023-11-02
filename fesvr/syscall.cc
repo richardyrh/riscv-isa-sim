@@ -167,7 +167,12 @@ syscall_t::syscall_t(htif_t* htif)
   table[80] = &syscall_t::sys_fstat;
   table[93] = &syscall_t::sys_exit;
   table[198] = &syscall_t::sys_socket;
+  table[200] = &syscall_t::sys_bind;
+  table[201] = &syscall_t::sys_listen;
+  table[202] = &syscall_t::sys_accept;
   table[203] = &syscall_t::sys_connect;
+  table[206] = &syscall_t::sys_sendto;
+  table[207] = &syscall_t::sys_recvfrom;
   table[291] = &syscall_t::sys_statx;
   table[1039] = &syscall_t::sys_lstat;
   table[2011] = &syscall_t::sys_getmainvars;
@@ -285,12 +290,56 @@ reg_t syscall_t::sys_socket(reg_t domain, reg_t type, reg_t protocol, reg_t a3, 
   return fds.alloc(fd);
 }
 
+reg_t syscall_t::sys_bind(reg_t fd, reg_t pbuf, reg_t len, reg_t a3, reg_t a4, reg_t a5, reg_t a6)
+{
+  std::vector<char> buf(len);
+  memif->read(pbuf, len, buf.data());
+  reg_t ret = sysret_errno(bind(fds.lookup(fd), (const sockaddr*) buf.data(), len));
+  return ret;
+}
+
+reg_t syscall_t::sys_accept(reg_t fd, reg_t a1, reg_t a2, reg_t a3, reg_t a4, reg_t a5, reg_t a6)
+{
+  int rfd = sysret_errno(accept(fds.lookup(fd), NULL, NULL));
+  if (rfd < 0)
+    return sysret_errno(-1);
+  return fds.alloc(rfd);
+}
+
+reg_t syscall_t::sys_listen(reg_t fd, reg_t backlog, reg_t a2, reg_t a3, reg_t a4, reg_t a5, reg_t a6)
+{
+  return sysret_errno(listen(fds.lookup(fd), backlog));
+}
+
 reg_t syscall_t::sys_connect(reg_t fd, reg_t pbuf, reg_t len, reg_t a3, reg_t a4, reg_t a5, reg_t a6)
 {
   std::vector<char> buf(len);
   memif->read(pbuf, len, buf.data());
   reg_t ret = sysret_errno(connect(fds.lookup(fd), (const sockaddr*) buf.data(), len));
   return ret;
+}
+
+reg_t syscall_t::sys_sendto(reg_t fd, reg_t pbuf, reg_t len, reg_t flags, reg_t pbuf2, reg_t len2, reg_t a6)
+{
+  std::vector<char> buf(len);
+  memif->read(pbuf, len, buf.data());
+  if (pbuf2 != 0) {
+    std::vector<char> buf2(len2);
+    memif->read(pbuf2, len2, buf2.data());
+    return sysret_errno(sendto(fds.lookup(fd), buf.data(), len, flags, (const sockaddr*) buf2.data(), len2));
+  } else {
+    return sysret_errno(sendto(fds.lookup(fd), buf.data(), len, flags, NULL, 0));
+  }
+}
+
+reg_t syscall_t::sys_recvfrom(reg_t fd, reg_t pbuf, reg_t len, reg_t flags, reg_t a4, reg_t a5, reg_t a6)
+{
+  std::vector<char> buf(len);
+  ssize_t ret = recv(fds.lookup(fd), buf.data(), len, flags);
+  reg_t ret_errno = sysret_errno(ret);
+  if (ret > 0)
+    memif->write(pbuf, ret, buf.data());
+   return ret_errno;
 }
 
 reg_t syscall_t::sys_lseek(reg_t fd, reg_t ptr, reg_t dir, reg_t a3, reg_t a4, reg_t a5, reg_t a6)

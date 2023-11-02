@@ -56,7 +56,12 @@ class syscall_t : public device_t
   reg_t sys_pwrite(reg_t, reg_t, reg_t, reg_t, reg_t, reg_t, reg_t);
   reg_t sys_close(reg_t, reg_t, reg_t, reg_t, reg_t, reg_t, reg_t);
   reg_t sys_socket(reg_t, reg_t, reg_t, reg_t, reg_t, reg_t, reg_t);
+  reg_t sys_bind(reg_t, reg_t, reg_t, reg_t, reg_t, reg_t, reg_t);
+  reg_t sys_listen(reg_t, reg_t, reg_t, reg_t, reg_t, reg_t, reg_t);
+  reg_t sys_accept(reg_t, reg_t, reg_t, reg_t, reg_t, reg_t, reg_t);
   reg_t sys_connect(reg_t, reg_t, reg_t, reg_t, reg_t, reg_t, reg_t);
+  reg_t sys_sendto(reg_t, reg_t, reg_t, reg_t, reg_t, reg_t, reg_t);
+  reg_t sys_recvfrom(reg_t, reg_t, reg_t, reg_t, reg_t, reg_t, reg_t);
   reg_t sys_lseek(reg_t, reg_t, reg_t, reg_t, reg_t, reg_t, reg_t);
   reg_t sys_fstat(reg_t, reg_t, reg_t, reg_t, reg_t, reg_t, reg_t);
   reg_t sys_lstat(reg_t, reg_t, reg_t, reg_t, reg_t, reg_t, reg_t);
