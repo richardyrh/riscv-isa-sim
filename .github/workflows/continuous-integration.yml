@@ -18,7 +18,7 @@ on:
 jobs:
   test:
     name: Test Spike build (Ubuntu)
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v2
         with:
@@ -29,7 +29,7 @@ jobs:
         run: sudo xargs apt-get install -y < .github/workflows/apt-packages.txt
 
       - run: |
-          for commit in $(git rev-list origin/master..HEAD); do
+          for commit in $(git rev-list origin/master..HEAD | tac); do
             git checkout $commit
             echo "Checking commit $commit"
             ci-tests/build-spike
@@ -49,7 +49,7 @@ jobs:
         run: xargs brew install --overwrite < .github/workflows/brew-packages.txt
 
       - run: |
-          for commit in $(git rev-list origin/master..HEAD); do
+          for commit in $(git rev-list origin/master..HEAD | tail -r); do
             git checkout $commit
             echo "Checking commit $commit"
             ci-tests/build-spike

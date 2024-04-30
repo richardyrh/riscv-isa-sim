@@ -324,7 +324,7 @@ int htif_t::run()
   }
 
   if (!binary_socket && (tohost_addr == 0)) {
-    while (true)
+    while (!signal_exit)
       idle();
   }
 
