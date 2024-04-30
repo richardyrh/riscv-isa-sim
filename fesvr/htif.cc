@@ -26,7 +26,7 @@
 // #include <cstdlib>
 #include <arpa/inet.h>
 #include <sys/socket.h>
-#include <unistd.h>
+#include <sys/un.h>
 #include <fcntl.h>
 #include <socketlib.h>
 
@@ -272,12 +272,47 @@ struct write_req {
     uint32_t addr;
     uint32_t size;
 };
+/*
+#define M_CLIENT_FILE 1
+#define M_SEND 2
+#define M_RECV 3
+
+typedef struct {
+  uint64_t valid;
+  uint64_t func_id;
+  uint64_t a1;
+  uint64_t a2;
+  uint64_t a3;
+  uint64_t a4;
+  char *dst;
+  char payload[];
+} mmio_req_t;
+
+typedef struct {
+  uint64_t ret;
+  uint64_t valid;
+} mmio_rsp_t;
+*/
+#define read_chunks(addr, len, buf) { \
+  for (size_t i = 0; i < len; i += 8) read_chunk((addr) + (uint64_t) i, 8, (uint8_t *) (buf) + (size_t) i); \
+}
+#define write_chunks(addr, len, buf) { \
+  for (size_t i = 0; i < len; i += 8) write_chunk((addr) + (uint64_t) i, 8, (uint8_t *) (buf) + (size_t) i); \
+}
+
+#define set_ret(retval) { \
+  mmio_rsp_t mrsp; \
+  mrsp.ret = retval; \
+  mrsp.valid = 1; \
+  write_chunks(0x91000000ULL, sizeof(mrsp), &mrsp); \
+}
 
 int htif_t::run()
 {
 
   bool binary_none = (!targs.empty() && targs[0] == "none");
   bool binary_socket = (!targs.empty() && targs[0] == "socket");
+  bool binary_sock_mmio = (!targs.empty() && (targs[0].find("headless") != std::string::npos));
 
   auto enq_func = [](std::queue<reg_t>* q, uint64_t x) { q->push(x); };
   std::queue<reg_t> fromhost_queue;
@@ -297,10 +332,18 @@ int htif_t::run()
     init_client(6969);
   }
 
+  if (binary_sock_mmio) {
+    char blank[sizeof(mmio_req_t)];
+    write_chunks(0x90000000ULL, sizeof(mmio_req_t), blank);
+    write_chunks(0x91000000ULL, sizeof(mmio_rsp_t), blank);
+  }
+
   uint64_t counter = 0;
   uint64_t tohost = 0;
   bool tohost_found = false;
   bool fromhost_found = false;
+  int new_socket = 0;
+  bool connected = false;
 
   int num_waits = 0;
   while (!signal_exit && exitcode == 0)
@@ -339,6 +382,109 @@ int htif_t::run()
         }
       } catch (mem_trap_t& t) {
         bad_address("accessing fromhost", t.get_tval());
+      }
+    }
+
+    // device_list.tick();
+    if (!binary_sock_mmio) {
+      idle();
+    } else {
+      counter++;
+      if (counter >= 20) {
+        if (!connected) printf(".");
+        fflush(stdout);
+        counter = 0;
+      }
+      uint64_t mreq_valid;
+      read_chunk(0x90000000ULL, sizeof(mreq_valid), &mreq_valid);
+      if (mreq_valid) {
+        mmio_req_t mreq;
+        read_chunks(0x90000000ULL, sizeof(mreq), &mreq);
+        mreq_valid = 0;
+        write_chunk(0x90000000ULL, sizeof(mreq_valid), &mreq_valid);
+        // printf("request from client: id %ld, args %ld %ld %ld %ld\n",
+        //     mreq.func_id, mreq.a1, mreq.a2, mreq.a3, mreq.a4);
+        switch (mreq.func_id) {
+          case M_CLIENT_FILE: {
+            struct sockaddr_un addr;
+            new_socket = socket(AF_UNIX, SOCK_STREAM, 0);
+            if (new_socket == -1) {
+              std::cerr << "Failed to connect." << std::endl;
+              exit(1);
+            }
+            memset(&addr, 0, sizeof(addr));
+            addr.sun_family = AF_UNIX;
+
+            char socket_path[sizeof(addr.sun_path)];
+            read_chunks(mreq.a1, sizeof(socket_path), socket_path);
+            socket_path[sizeof(socket_path) - 1] = 0;
+            endpoint_id_t endpoint_id = (endpoint_id_t) mreq.a2;
+            printf("attempt to connect to UDF %s with id %d\n", socket_path, endpoint_id);
+
+            strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
+            if (connect(new_socket, (struct sockaddr *) &addr, sizeof(addr)) == 0) {
+              std::cout << "Connected to file " << socket_path << " with socket fd " << new_socket << std::endl;
+              if ((send(new_socket, &endpoint_id, sizeof(endpoint_id_t), 0) < 0)) {
+                close(new_socket);
+                std::cerr << "Failed to register endpoint ID." << std::endl;
+                exit(1);
+              }
+              // fcntl(new_socket, F_SETFL, O_NONBLOCK);
+            } else {
+              std::cerr << "Failed to connect." << std::endl;
+              exit(1);
+            }
+            connected = true;
+            set_ret((uint64_t) new_socket);
+            break;
+          }
+          case M_SEND: {
+            char out_buf[mreq.a3];
+            read_chunks(mreq.a2, mreq.a3, out_buf);
+            int retval = send((int) mreq.a1, out_buf, (int) mreq.a3, (int) mreq.a4);
+            set_ret(retval);
+            // printf("s");
+            break;
+          }
+          case M_RECV: {
+            char in_buf[mreq.a3];
+            int retval = recv((int) mreq.a1, in_buf, (int) mreq.a3, (int) mreq.a4);
+            write_chunks(mreq.a2, mreq.a3, in_buf);
+            set_ret(retval);
+            // printf("r");
+            break;
+          }
+          case M_CLIENT_PORT: {
+            struct sockaddr_in server_addr;
+            new_socket = socket(PF_INET, SOCK_STREAM, 0);
+
+            int port = (int) mreq.a1;
+            endpoint_id_t endpoint_id = (endpoint_id_t) mreq.a2;
+            printf("attempt to connect to TCP %d with id %d\n", port, endpoint_id);
+
+            server_addr.sin_family = AF_INET;
+            server_addr.sin_port = htons(port);
+            inet_pton(AF_INET, "127.0.0.1", &server_addr.sin_addr);
+
+            if (connect(new_socket, (struct sockaddr *) &server_addr, sizeof(server_addr)) == 0) {
+              std::cout << "Connected to port " << port << std::endl;
+              if (send(new_socket, &endpoint_id, sizeof(endpoint_id_t), 0) < 0) {
+                close(new_socket);
+                std::cerr << "Failed to register endpoint ID." << std::endl;
+                exit(1);
+              }
+              // fcntl(new_socket, F_SETFL, O_NONBLOCK);
+            } else {
+              std::cerr << "Failed to connect." << std::endl;
+              exit(1);
+            }
+            connected = true;
+            set_ret((uint64_t) new_socket);
+            break;
+          }
+          default:
+            break;
+        }
       }
     }
 
@@ -397,110 +543,7 @@ int htif_t::run()
       }
     }
 
-    // // Receive data from the socket
-    // std::string line;
-    // std::string buffer;
-    // char chunk[1024];
-    // int bytes_read;
-
-    // if ((bytes_read = recv(new_socket, chunk, sizeof(chunk), 0)) > 0) {
-    //   buffer.append(chunk, bytes_read);
-    //   size_t pos;
-    //   if ((pos = buffer.find('\n')) != std::string::npos) {
-    //     line = buffer.substr(0, pos);
-    //     buffer.erase(0, pos + 1);
-
-    //     // Handle the received line (process it)
-    //     if (!line.empty()) {
-    //       std::cout << "Received line: " << line << std::endl;
-    //     }
-    //   } else {
-    //     std::cout << "Newline not found" << std::endl;
-    //     continue;
-    //   }
-    // } else {
-    //   continue;
-    // }
-
-    // std::istringstream iss(line);
-    // std::vector<std::string> tokens;
-    // std::string token;
-
-    // // Tokenize the input by space
-    // while (iss >> token) {
-    //   tokens.push_back(token);
-    // }
-    // if (tokens.size() < 1) continue;
-
-    // std::string command = tokens[0];
-
-    // // Handle commands
-    // if (command == "elf") {
-    //   CHECK_TOKEN_SIZE(2);
-    //   std::string path = tokens[1];
-    //   std::cout << "Loading elf from " << path << std::endl;
-    //   load_payload(path, &entry);
-    //   // load_program();
-    // } else if (command == "binary") {
-    //   CHECK_TOKEN_SIZE(3);
-    //   std::string path = tokens[2];
-    //   long address = std::strtol(tokens[1].c_str(), nullptr, 16);
-    //   std::cout << "Loading binary from " << path << " to memory address: " << std::hex << address << std::endl;
-    //   try {
-    //     path = find_file(path);
-    //     std::ifstream file(path, std::ios::binary);
-    //     if (!file) throw std::runtime_error("");
-    //     char buffer[chunk_max_size()];
-    //     size_t offset = 0;
-    //     while (file.good()) {
-    //       file.read(buffer, chunk_max_size());
-    //       size_t size = file.gcount();
-    //       if (size > 0) {
-    //         write_chunk(address + offset, size, buffer);
-    //         offset += size;
-    //       }
-    //     }
-    //     file.close();
-    //   } catch (...) {
-    //     std::cerr << "Binary loading failed" << std::endl;
-    //   }
-    // } else if (command == "sw") {
-    //   CHECK_TOKEN_SIZE(3);
-    //   long address = std::strtol(tokens[1].c_str(), nullptr, 16);
-    //   reg_t data = (reg_t) std::strtol(tokens[2].c_str(), nullptr, 0);
-    //   std::cout << "M[0x" << std::hex << address << "] <- 0x" << std::hex << data << std::endl;
-    //   write_chunk(address, sizeof(reg_t), &data);
-    // } else if (command == "read") {
-    //   CHECK_TOKEN_SIZE(3);
-    //   long address = std::strtol(tokens[1].c_str(), nullptr, 16);
-    //   size_t size = (size_t) std::strtol(tokens[2].c_str(), nullptr, 0);
-    //   char buffer[size];
-    //   std::cout << "Reading " << size << " bytes from 0x" << std::hex << address << std::endl;
-    //   read_chunk(address, size, buffer);
-    //   for (size_t offset = 0; offset < size; offset += 16) {
-    //     std::cout << "0x" << std::setw(8) << std::setfill('0') << std::hex << offset << ": ";
-    //     for (int i = 0; i < 16; i += 4) {
-    //       if (offset + i < size) {
-    //         auto word = *reinterpret_cast<const int*>(buffer + offset + i);
-    //         std::cout << std::setw(8) << std::setfill('0') << std::hex << word << ' ';
-    //       }
-    //     }
-    //     std::cout << std::endl;
-    //   }
-    // } else if (command == "run") {
-    //   std::cout << "Resetting core" << std::endl;
-    //   reset();
-    // } else if (command == "quit") {
-    //   exit(0);
-    // } else {
-    //   std::cerr << "Unknown command: " << command << std::endl;
-    //   std::cout << "Available commands: elf binary sw read run quit" << std::endl;
-    // }
-    // std::cout << "Ready for the next command" << std::endl;
   }
-  // std::cout << "Socket closed" << std::endl;
-  // close(new_socket);
-
   stop();
 
   return exit_code();
